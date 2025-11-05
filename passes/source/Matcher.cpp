@@ -260,6 +260,7 @@ match1Dor2DPtrOpAndInductionVariables(GetElementPtrInst *&GEPInst, Value *&Op,
                                       Value *&LD) {
   // TODO: Make dummy GEPs optional
   GetElementPtrInst *DummyGEP;
+  GetElementPtrInst *BaseOffsetGEP; 
   return m_OneOf(
       m_GEP(DummyGEP, m_Load(m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2))),
             m_PHI(PHI1)),
@@ -268,7 +269,9 @@ match1Dor2DPtrOpAndInductionVariables(GetElementPtrInst *&GEPInst, Value *&Op,
       m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2)),
             matchPHITimesLD(PHI1, LD)),
       m_GEP(GEPInst, m_Value(Op), m_PHI(PHI1), m_PHI(PHI2)),
-      m_GEP(GEPInst, m_Value(Op), linearFunctionOfPHI(PHI1, PHI2, LD)));
+      m_GEP(GEPInst, m_Value(Op), linearFunctionOfPHI(PHI1, PHI2, LD)),
+      m_GEP(GEPInst, m_GEP(BaseOffsetGEP, m_Value(Op), m_ConstantInt()),
+            linearFunctionOfPHI(PHI1, PHI2, LD)));
 }
 
 // A helper function that returns a matcher of a load to flat or 2D array. The
