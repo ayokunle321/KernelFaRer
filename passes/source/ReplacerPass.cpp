@@ -26,6 +26,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include "KernelFaRer.h"
+#include "llvm/IR/Constants.h"
 
 #define PLUGIN_NAME "kernelfarer"
 #define PASS_NAME "kernel-replacer-pass"
@@ -153,6 +154,32 @@ auto *prepEigenInt64(IRBuilder<> &IR, Value *const &V) {
   return V;
 }
 
+/// A helper function that checks if increment is constant 1
+///
+/// \param Inc a Value pointer to an increment or nullptr
+///
+/// \returns true if Inc is nullptr or a constant integer equal to 1
+bool isIncOne(Value *Inc) {
+  if (!Inc)
+    return true; // No increment means increment of 1
+  if (auto *CI = dyn_cast<ConstantInt>(Inc))
+    return CI->getZExtValue() == 1;
+  return false;
+}
+
+/// A helper function that gets increment value as i32 or constant 1
+///
+/// \param IR the IRBuilder to use
+/// \param Inc a Value pointer to an increment or nullptr
+/// \param Downcast reference to bool that tracks if downcast occurred
+///
+/// \returns the increment value as i32, or constant 1 if Inc is nullptr
+Value *getIncOrOne(IRBuilder<> &IR, Value *Inc, bool &Downcast) {
+  if (!Inc)
+    return IR.getInt32(1);
+  return prepBLASInt32(IR, Inc, Downcast);
+}
+
 inline void insertNoInlineCall(Module &M, IRBuilder<> &IR,
                                ArrayRef<Type *> ArgTys, ArrayRef<Value *> Args,
                                StringRef FunctionName) {
@@ -187,7 +214,7 @@ void buildBLASGEMMCall(Module &Mod, IRBuilder<> &IR,
   // BLAS interface only supports I32 so we will warn when we downcast.
   bool Downcast = false;
 
-  // Make args for M, N, K.
+  // Make args for M, N, K - will be adjusted for increments later
   auto *M = prepBLASInt32(IR, &MA.getRows(), Downcast);
   auto *K = prepBLASInt32(IR, &MA.getColumns(), Downcast);
   auto *N = prepBLASInt32(IR, &MB.getColumns(), Downcast);
@@ -197,10 +224,58 @@ void buildBLASGEMMCall(Module &Mod, IRBuilder<> &IR,
   auto *B = &MB.getBaseAddressPointer();
   auto *C = &MC.getBaseAddressPointer();
 
-  // Make args for LDA, LDB, LDC.
+  // Make args for LDA, LDB, LDC, adjusting for increments if present
   auto *LDA = prepBLASInt32(IR, &MA.getLeadingDimensionSize(), Downcast);
   auto *LDB = prepBLASInt32(IR, &MB.getLeadingDimensionSize(), Downcast);
   auto *LDC = prepBLASInt32(IR, &MC.getLeadingDimensionSize(), Downcast);
+  
+  Value *IncI = Gemm.getIncI(); 
+  Value *IncJ = Gemm.getIncJ(); 
+  Value *IncK = Gemm.getIncK();
+
+  
+  // Adjust leading dimensions based on increments
+  if (IncI && !isIncOne(IncI)) {
+    Value *IncIVal = getIncOrOne(IR, IncI, Downcast);
+    LDA = IR.CreateMul(LDA, IncIVal);
+    LDC = IR.CreateMul(LDC, IncIVal);
+  }
+  
+  if (IncJ && !isIncOne(IncJ)) {
+    Value *IncJVal = getIncOrOne(IR, IncJ, Downcast);
+    LDB = IR.CreateMul(LDB, IncJVal);
+    LDC = IR.CreateMul(LDC, IncJVal);
+  }
+  
+  if (IncK && !isIncOne(IncK)) {
+    Value *IncKVal = getIncOrOne(IR, IncK, Downcast);
+    LDA = IR.CreateMul(LDA, IncKVal);
+    LDB = IR.CreateMul(LDB, IncKVal);
+    LDC = IR.CreateMul(LDC, IncKVal);
+  }
+  
+  // Adjust dimensions M, N, K based on increments
+  Value *One = IR.getInt32(1);
+  if (IncI && !isIncOne(IncI)) {
+    Value *IncIVal = getIncOrOne(IR, IncI, Downcast);
+    Value *IncMinusOne = IR.CreateSub(IncIVal, One);
+    Value *MPlusIncMinusOne = IR.CreateAdd(M, IncMinusOne);
+    M = IR.CreateUDiv(MPlusIncMinusOne, IncIVal);
+  }
+  
+  if (IncJ && !isIncOne(IncJ)) {
+    Value *IncJVal = getIncOrOne(IR, IncJ, Downcast);
+    Value *IncMinusOne = IR.CreateSub(IncJVal, One);
+    Value *NPlusIncMinusOne = IR.CreateAdd(N, IncMinusOne);
+    N = IR.CreateUDiv(NPlusIncMinusOne, IncJVal);
+  }
+  
+  if (IncK && !isIncOne(IncK)) {
+    Value *IncKVal = getIncOrOne(IR, IncK, Downcast);
+    Value *IncMinusOne = IR.CreateSub(IncKVal, One);
+    Value *KPlusIncMinusOne = IR.CreateAdd(K, IncMinusOne);
+    K = IR.CreateUDiv(KPlusIncMinusOne, IncKVal);
+  }
 
   // C's pointed to type defines the operation type.
   auto *OpTy = MC.getScalarElementType();
@@ -489,6 +564,26 @@ void buildEigenCall(Module &Mod, IRBuilder<> &IR, const KernelFaRer::GEMM &Gemm)
 
 namespace KernelFaRer {
 
+// Helper function to check if a value is loop invariant
+static bool isLoopInvariantValue(Value *V, Loop &L) {
+  if (isa<Constant>(V))
+    return true;
+  if (auto *Arg = dyn_cast<Argument>(V))
+    return true;
+  if (auto *Inst = dyn_cast<Instruction>(V)) {
+    // Check if instruction is defined outside the loop
+    if (!L.contains(Inst->getParent()))
+      return true;
+    // Check if all operands are loop invariant
+    for (Value *Op : Inst->operands()) {
+      if (!isLoopInvariantValue(Op, L))
+        return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 // Replaces the corresponding basic blocks of MatMul IR with a call to
 // llvm.matrix.multiply.
 bool runImpl(Function &F, KernelMatcher::Result &GMPR, OptimizationRemarkEmitter &ORE) {
@@ -522,6 +617,70 @@ bool runImpl(Function &F, KernelMatcher::Result &GMPR, OptimizationRemarkEmitter
     if (Ker->getMatrixC().isDoublePtr()) {
       ORE.emit(ORM << "Matrix C was two dimensional pointer. Cannot replace kernel code.\n");
       return false;
+    }
+
+    // Validate increment values for GEMM kernels
+    if (const auto *GEMM = dyn_cast_or_null<KernelFaRer::GEMM>(Ker.get())) {
+      Value *IncI = GEMM->getIncI();
+      Value *IncJ = GEMM->getIncJ();
+      Value *IncK = GEMM->getIncK();
+      
+      // Check if increments are loop invariant (required for correctness)
+      if (IncI && !isLoopInvariantValue(IncI, L)) {
+        ORE.emit(ORM << "Induction variable I has non-loop-invariant increment. Cannot replace kernel code.");
+        continue;
+      }
+      if (IncJ && !isLoopInvariantValue(IncJ, L)) {
+        ORE.emit(ORM << "Induction variable J has non-loop-invariant increment. Cannot replace kernel code.");
+        continue;
+      }
+      if (IncK && !isLoopInvariantValue(IncK, L)) {
+        ORE.emit(ORM << "Induction variable K has non-loop-invariant increment. Cannot replace kernel code.");
+        continue;
+      }
+      
+      // Extract constant integer values if available for validation
+      uint64_t IncIVal = 1;
+      uint64_t IncJVal = 1;
+      uint64_t IncKVal = 1;
+      bool HasConstIncI = false;
+      bool HasConstIncJ = false;
+      bool HasConstIncK = false;
+      
+      if (IncI) {
+        // Non-constant but loop-invariant increments are okay, but handle them at runtime
+        if (auto *CI = dyn_cast<ConstantInt>(IncI)) {
+          IncIVal = CI->getZExtValue();
+          HasConstIncI = true;
+        }
+      }
+      
+      if (IncJ) {
+        if (auto *CI = dyn_cast<ConstantInt>(IncJ)) {
+          IncJVal = CI->getZExtValue();
+          HasConstIncJ = true;
+        }
+      }
+      
+      if (IncK) {
+        if (auto *CI = dyn_cast<ConstantInt>(IncK)) {
+          IncKVal = CI->getZExtValue();
+          HasConstIncK = true;
+        }
+      }
+      
+      // Cannot skip both I and J: if incI != 1 then incJ must be 1 (and vice versa)
+      // Only checks constants; non-constant loop-invariant values are allowed
+      if (HasConstIncI && IncIVal != 1 && HasConstIncJ && IncJVal != 1) {
+        ORE.emit(ORM << "Cannot skip both rows (I) and columns (J) in GEMM. Cannot replace kernel code.");
+        continue;
+      }
+      
+      // Validation: Cannot skip in K dimension (reduction dimension)
+      if (HasConstIncK && IncKVal != 1) {
+        ORE.emit(ORM << "Cannot skip elements in reduction dimension K. Cannot replace kernel code.");
+        continue;
+      }
     }
 
     // Collect the only possible block exited *from*. This was verified already

@@ -111,17 +111,20 @@ protected:
   Matrix MatrixC;
   Value *Alpha;
   Value *Beta;
+  Value *IncI;
+  Value *IncJ;
+  Value *IncK;
   SmallSetVector<const Value *, 2> Stores;
 
 public:
   Kernel(KernelType KernelID, Loop &L, Instruction &RS, Matrix &MatrixA,
          Matrix &MatrixB, Matrix &MatrixC,
          SmallSetVector<const Value *, 2> Stores, Value *Alpha = nullptr,
-         Value *Beta = nullptr)
+         Value *Beta = nullptr, Value *IncI = nullptr, Value *IncJ = nullptr, Value *IncK = nullptr)
       : KernelID(KernelID), L(L), ReductionStore(RS),
         MatrixA(std::move(MatrixA)), MatrixB(std::move(MatrixB)),
         MatrixC(std::move(MatrixC)), Alpha(Alpha), Beta(Beta),
-        Stores(std::move(Stores)) {}
+        IncI(IncI), IncJ(IncJ), IncK(IncK), Stores(std::move(Stores)) {}
   virtual ~Kernel() = default;
   Loop &getAssociatedLoop() const { return L; }
   Instruction &getReductionStore() const { return ReductionStore; }
@@ -130,6 +133,9 @@ public:
   const Matrix &getMatrixC() const { return MatrixC; }
   Value *getAlpha() const { return Alpha; }
   Value *getBeta() const { return Beta; }
+  Value *getIncI() const { return IncI; }
+  Value *getIncJ() const { return IncJ; }
+  Value *getIncK() const { return IncK; }
   KernelType getKernelID() const { return KernelID; }
 
   virtual bool isKernelStore(const Value &Store) const = 0;
@@ -144,9 +150,9 @@ class GEMM : public Kernel {
 public:
   GEMM(Loop &L, Instruction &RS, Matrix &MatrixA, Matrix &MatrixB,
        Matrix &MatrixC, SmallSetVector<const Value *, 2> Stores,
-       bool CIsReduced, Value *Alpha = nullptr, Value *Beta = nullptr)
+       bool CIsReduced, Value *Alpha = nullptr, Value *Beta = nullptr, Value *IncI = nullptr, Value *IncJ = nullptr, Value *IncK = nullptr)
       : Kernel(Kernel::GEMM_KERNEL, L, RS, MatrixA, MatrixB, MatrixC, Stores,
-               Alpha, Beta),
+               Alpha, Beta, IncI, IncJ, IncK),
         CIsReduced(CIsReduced) {}
 
   /// This method indicates if C is part of the reduction or not.
@@ -188,7 +194,7 @@ public:
     auto &LDB = MatrixB.getLeadingDimensionSize();
     auto &LDC = MatrixC.getLeadingDimensionSize();
 
-    return (&V == Alpha || &V == Beta || &V == &IndVarI || &V == &IndVarJ ||
+    return (&V == Alpha || &V == Beta || &V == IncI || &V == IncJ || &V == IncK || &V == &IndVarI || &V == &IndVarJ ||
             &V == &IndVarK || &V == &M || &V == &N || &V == &K ||
             &V == &ABaseAddr || &V == &BBaseAddr || &V == &CBaseAddr ||
             &V == &LDA || &V == &LDB || &V == &LDC);
@@ -206,9 +212,9 @@ class SYR2K : public Kernel {
 public:
   SYR2K(Loop &L, Instruction &RS, Matrix &MatrixA, Matrix &MatrixB,
         Matrix &MatrixC, SmallSetVector<const Value *, 2> Stores,
-        Value *Alpha = nullptr, Value *Beta = nullptr, Value *Uplo = nullptr)
+        Value *Alpha = nullptr, Value *Beta = nullptr, Value *IncI = nullptr, Value *IncJ = nullptr, Value *IncK = nullptr, Value *Uplo = nullptr)
       : Kernel(Kernel::SYR2K_KERNEL, L, RS, MatrixA, MatrixB, MatrixC, Stores,
-               Alpha, Beta),
+               Alpha, Beta, IncI, IncJ, IncK),
         Uplo(Uplo) {}
 
   Value *getUplo() const { return Uplo; }
@@ -226,7 +232,7 @@ public:
     auto &IndVarK = MatrixA.getColumnIV();
     auto &IndVarJ = MatrixB.getColumnIV();
 
-    return (&V == Alpha || &V == Beta || &V == &IndVarI || &V == &IndVarJ ||
+    return (&V == Alpha || &V == Beta || &V == IncI || &V == IncJ || &V == IncK || &V == &IndVarI || &V == &IndVarJ ||
             &V == &IndVarK || &V == &N || &V == &K ||
             &V == &MatrixA.getBaseAddressPointer() ||
             &V == &MatrixB.getBaseAddressPointer() ||

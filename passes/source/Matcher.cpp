@@ -346,7 +346,7 @@ static inline auto matchSYR2KStore(const Value *C, Value *&AddLHS,
 // values, a initialization value (ConstantInt) and a post-increment value
 // (AddInst). A chain of PHINodes is the IR pattern produced when compiling
 // tiled loop nests.
-static inline PHINode *extractOutermostPHI(PHINode *const &V) {
+static inline PHINode *extractOutermostPHI(PHINode *const &V, Value *&Inc) {
   if (!isa<PHINode>(V))
     return nullptr;
 
@@ -359,8 +359,8 @@ static inline PHINode *extractOutermostPHI(PHINode *const &V) {
 
     if (match(
             PHI,
-            m_OneOf(m_PHI(m_c_Add(m_Specific(PHI), m_Value()), m_ConstantInt()),
-                    m_PHI(m_ConstantInt(), m_c_Add(m_Specific(PHI), m_Value())),
+            m_OneOf(m_PHI(m_c_Add(m_Specific(PHI), m_Value(Inc)), m_ConstantInt()),
+                    m_PHI(m_ConstantInt(), m_c_Add(m_Specific(PHI), m_Value(Inc))),
                     m_PHI(m_ConstantInt(), m_ConstantInt()))))
       return const_cast<PHINode *>(PHI);
 
@@ -527,17 +527,24 @@ static bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1,
                               PHINode *&B2, PHINode *&C1, PHINode *&C2,
                               CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
                               CBLAS_ORDER &CLayout, Value *&I, Value *&J,
-                              Value *&K, LoopInfo &LI) {
+                              Value *&K, Value *&IncI, Value *&IncJ, Value *&IncK,
+                              LoopInfo &LI) {
   if (A1 == nullptr || A2 == nullptr || B1 == nullptr || B2 == nullptr ||
       C1 == nullptr || C2 == nullptr)
     return false;
   bool Matched = true;
-  A1 = extractOutermostPHI(A1);
-  A2 = extractOutermostPHI(A2);
-  B1 = extractOutermostPHI(B1);
-  B2 = extractOutermostPHI(B2);
-  C1 = extractOutermostPHI(C1);
-  C2 = extractOutermostPHI(C2);
+  Value *IncA1 = nullptr;
+  Value *IncA2 = nullptr;
+  Value *IncB1 = nullptr;
+  Value *IncB2 = nullptr;
+  Value *IncC1 = nullptr;
+  Value *IncC2 = nullptr;
+  A1 = extractOutermostPHI(A1, IncA1);
+  A2 = extractOutermostPHI(A2, IncA2);
+  B1 = extractOutermostPHI(B1, IncB1);
+  B2 = extractOutermostPHI(B2, IncB2);
+  C1 = extractOutermostPHI(C1, IncC1);
+  C2 = extractOutermostPHI(C2, IncC2);
   PHINode *II = nullptr;
   PHINode *JJ = nullptr;
   PHINode *KK = nullptr;
@@ -608,6 +615,25 @@ static bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1,
       I = II;
       J = JJ;
       K = KK;
+      // Map increments to I, J, K based on the same mapping
+      if (II == A1) IncI = IncA1;
+      else if (II == A2) IncI = IncA2;
+      else if (II == B1) IncI = IncB1;
+      else if (II == B2) IncI = IncB2;
+      else if (II == C1) IncI = IncC1;
+      else if (II == C2) IncI = IncC2;
+      if (JJ == A1) IncJ = IncA1;
+      else if (JJ == A2) IncJ = IncA2;
+      else if (JJ == B1) IncJ = IncB1;
+      else if (JJ == B2) IncJ = IncB2;
+      else if (JJ == C1) IncJ = IncC1;
+      else if (JJ == C2) IncJ = IncC2;
+      if (KK == A1) IncK = IncA1;
+      else if (KK == A2) IncK = IncA2;
+      else if (KK == B1) IncK = IncB1;
+      else if (KK == B2) IncK = IncB2;
+      else if (KK == C1) IncK = IncC1;
+      else if (KK == C2) IncK = IncC2;
     } else {
       // Not GEMM
       Matched = false;
@@ -657,7 +683,8 @@ static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
                       Value *&BasePtrToC, Value *&LDA, Value *&LDB, Value *&LDC,
                       CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
                       CBLAS_ORDER &CLayout, LoopInfo &LI, Value *&Alpha,
-                      Value *&Beta, bool &IsCReduced) {
+                      Value *&Beta, bool &IsCReduced, Value *&IncI,
+                      Value *&IncJ, Value *&IncK) {
   auto *SeedInstAsValue = static_cast<Value *>(&SeedInst);
   Value *Alpha1 = nullptr;
   PHINode *APHI1 = nullptr;
@@ -686,7 +713,7 @@ static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
       // C = alpha? * A * B + beta? * C
       (MatchedGEP == nullptr || MatchedGEP == LoadPtrOp) &&
       matchMatrixLayout(APHI1, APHI2, BPHI1, BPHI2, CPHI1, CPHI2, ALayout,
-                        BLayout, CLayout, IVarI, IVarJ, IVarK, LI)) {
+                        BLayout, CLayout, IVarI, IVarJ, IVarK, IncI, IncJ, IncK, LI)) {
     // If Alpha is not match with the reduction matcher, use the matched value
     // from the store matcher.
     if (Alpha == nullptr)
@@ -704,7 +731,7 @@ static bool matchSYR2K(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
                        Value *&BasePtrToC, Value *&LDA, Value *&LDB,
                        Value *&LDC, CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
                        CBLAS_ORDER &CLayout, Value *&Alpha, Value *&Beta,
-                       LoopInfo &LI) {
+                       LoopInfo &LI, Value *&IncI, Value *&IncJ, Value *&IncK) {
   Value *SeedInstAsValue = static_cast<Value *>(&SeedInst);
   Value *AddLHS = nullptr;
   Value *AddRHS = nullptr;
@@ -739,7 +766,7 @@ static bool matchSYR2K(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
                           GEPC, BasePtrToC, CPHI1, CPHI2, LDC)) &&
       match(AddLHS, AddLHSMatcher) &&
       matchMatrixLayout(APHI[0], APHI[1], BPHI[0], BPHI[1], CPHI1, CPHI2,
-                        ALayout, BLayout, CLayout, IVarI, IVarJ, IVarK, LI) &&
+                        ALayout, BLayout, CLayout, IVarI, IVarJ, IVarK, IncI, IncJ, IncK, LI) &&
       match(AddRHS, AddRHSMatcher) &&
       matchSyr2kIndVarAndLayout(BasePtrToA, BasePtrToA2, BasePtrToB,
                                 BasePtrToB2, APHI, BPHI, ALayout, BLayout))
@@ -785,6 +812,8 @@ static void collectOtherKernelStoresToC(
         Value *LDC1 = nullptr;
         PHINode *PHI1 = nullptr;
         PHINode *PHI2 = nullptr;
+        Value *Inc1 = nullptr;
+        Value *Inc2 = nullptr;
         Value *Alpha1 = nullptr;
         Value *Beta1 = nullptr;
         GetElementPtrInst *GEPC1 = nullptr;
@@ -799,10 +828,10 @@ static void collectOtherKernelStoresToC(
             (LDC1 == nullptr || LDC1 == LDC) &&
             ((Alpha == nullptr || Alpha1 == nullptr) || Alpha == Alpha1) &&
             ((Beta == nullptr || Beta1 == nullptr) || Beta == Beta1) &&
-            (IVarI == extractOutermostPHI(PHI1) ||
-             IVarI == extractOutermostPHI(PHI2) ||
-             IVarJ == extractOutermostPHI(PHI1) ||
-             IVarJ == extractOutermostPHI(PHI2)) &&
+            (IVarI == extractOutermostPHI(PHI1, Inc1) ||
+             IVarI == extractOutermostPHI(PHI2, Inc2) ||
+             IVarJ == extractOutermostPHI(PHI1, Inc1) ||
+             IVarJ == extractOutermostPHI(PHI2, Inc2)) &&
             DT.dominates(BB, ReductionBB) && BB != ReductionBB) {
           if (Beta1 != nullptr)
             IsCReduced = true;
@@ -884,6 +913,9 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
         Value *K = nullptr;
         Value *Alpha = nullptr;
         Value *Beta = nullptr;
+        Value *IncI = nullptr;
+        Value *IncJ = nullptr;
+        Value *IncK = nullptr;
         CBLAS_ORDER ALayout;
         CBLAS_ORDER BLayout;
         CBLAS_ORDER CLayout;
@@ -896,7 +928,7 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
         // Syr2k pattern
         if (matchSYR2K(*Inst, IVarI, IVarJ, IVarK, GEPA, BasePtrToA, GEPB,
                        BasePtrToB, GEPC, BasePtrToC, LDA, LDB, LDC, ALayout,
-                       BLayout, CLayout, Alpha, Beta, LI) &&
+                       BLayout, CLayout, Alpha, Beta, LI, IncI, IncJ, IncK) &&
             matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
             matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K)) {
           KT = Kernel::KernelType::SYR2K_KERNEL;
@@ -905,7 +937,7 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
         } else if (matchGEMM(*Inst, IVarI, IVarJ, IVarK, GEPA, BasePtrToA, GEPB,
                              BasePtrToB, GEPC, BasePtrToC, LDA, LDB, LDC,
                              ALayout, BLayout, CLayout, LI, Alpha, Beta,
-                             IsCReduced) &&
+                             IsCReduced, IncI, IncJ, IncK) &&
                    matchLoopUpperBound(LI, static_cast<PHINode *>(IVarI), M) &&
                    matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
                    matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K)) {
@@ -980,7 +1012,7 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
                          *N, *IVarI, *IVarJ);
           ListOfKernels->push_back(
               std::make_unique<SYR2K>(*OuterLoop, *Inst, MatrixA, MatrixB,
-                                      MatrixC, Stores, Alpha, Beta));
+                                      MatrixC, Stores, Alpha, Beta, IncI, IncJ, IncK));
         } else {
           // Note that LD* is determined first by the overall storage order
           // then whether or not the matrix has been transposed.
@@ -1023,7 +1055,7 @@ KernelMatcher::Result KernelMatcher::run(Function &F, LoopInfo &LI,
                          *N, *IVarI, *IVarJ);
           ListOfKernels->push_back(
               std::make_unique<GEMM>(*OuterLoop, *Inst, MatrixA, MatrixB,
-                                     MatrixC, Stores, IsCReduced, Alpha, Beta));
+                                     MatrixC, Stores, IsCReduced, Alpha, Beta, IncI, IncJ, IncK));
         }
       }
     }
