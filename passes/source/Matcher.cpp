@@ -260,18 +260,37 @@ match1Dor2DPtrOpAndInductionVariables(GetElementPtrInst *&GEPInst, Value *&Op,
                                       Value *&LD) {
   // TODO: Make dummy GEPs optional
   GetElementPtrInst *DummyGEP;
-  GetElementPtrInst *BaseOffsetGEP; 
-  return m_OneOf(
-      m_GEP(DummyGEP, m_Load(m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2))),
-            m_PHI(PHI1)),
-      m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), matchPHITimesLD(PHI1, LD)),
-            m_PHI(PHI2)),
-      m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2)),
-            matchPHITimesLD(PHI1, LD)),
-      m_GEP(GEPInst, m_Value(Op), m_PHI(PHI1), m_PHI(PHI2)),
-      m_GEP(GEPInst, m_Value(Op), linearFunctionOfPHI(PHI1, PHI2, LD)),
-      m_GEP(GEPInst, m_GEP(BaseOffsetGEP, m_Value(Op), m_ConstantInt()),
-            linearFunctionOfPHI(PHI1, PHI2, LD)));
+  
+  auto Pattern1 = m_GEP(DummyGEP, m_Load(m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2))),
+                        m_PHI(PHI1));
+  auto Pattern2 = m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), matchPHITimesLD(PHI1, LD)),
+                        m_PHI(PHI2));
+  auto Pattern3 = m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2)),
+                        matchPHITimesLD(PHI1, LD));
+  auto Pattern4 = m_GEP(GEPInst, m_Value(Op), m_PHI(PHI1), m_PHI(PHI2));
+  auto Pattern5 = m_GEP(GEPInst, m_Value(Op), linearFunctionOfPHI(PHI1, PHI2, LD));
+  
+ // Linearized 2D access: GEP(base, sext(offset + PHI + LD*PHI))
+ auto Pattern6 = m_GEP(
+    GEPInst, m_Value(Op),
+    m_CombineOr(
+        m_CombineOr(
+            m_SExt(m_Add(
+                m_Add(m_Value(), m_CombineOr(m_Trunc(m_PHI(PHI1)), m_PHI(PHI1))),
+                m_Mul(m_Value(LD), m_CombineOr(m_Trunc(m_PHI(PHI2)), m_PHI(PHI2))))),
+            m_SExt(m_Add(
+                m_Mul(m_Value(LD), m_CombineOr(m_Trunc(m_PHI(PHI2)), m_PHI(PHI2))),
+                m_Add(m_Value(), m_CombineOr(m_Trunc(m_PHI(PHI1)), m_PHI(PHI1)))))),
+        // Without sext
+        m_CombineOr(
+            m_Add(
+                m_Add(m_Value(), m_CombineOr(m_Trunc(m_PHI(PHI1)), m_PHI(PHI1))),
+                m_Mul(m_Value(LD), m_CombineOr(m_Trunc(m_PHI(PHI2)), m_PHI(PHI2)))),
+            m_Add(
+                m_Mul(m_Value(LD), m_CombineOr(m_Trunc(m_PHI(PHI2)), m_PHI(PHI2))),
+                m_Add(m_Value(), m_CombineOr(m_Trunc(m_PHI(PHI1)), m_PHI(PHI1)))))));
+  
+  return m_OneOf(Pattern1, Pattern2, Pattern3, Pattern4, Pattern5, Pattern6);
 }
 
 // A helper function that returns a matcher of a load to flat or 2D array. The
