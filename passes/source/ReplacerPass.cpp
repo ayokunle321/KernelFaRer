@@ -670,14 +670,16 @@ bool runImpl(Function &F, KernelMatcher::Result &GMPR, OptimizationRemarkEmitter
       }
       
       // Cannot skip both I and J: if incI != 1 then incJ must be 1 (and vice versa)
-      // Only checks constants; non-constant loop-invariant values are allowed
-      if (HasConstIncI && IncIVal != 1 && HasConstIncJ && IncJVal != 1) {
+      // This check applies to both constant and non-constant increments, since the
+      // dimension adjustment code multiplies LDC by both increments if both are non-1
+      if (!isIncOne(IncI) && !isIncOne(IncJ)) {
         ORE.emit(ORM << "Cannot skip both rows (I) and columns (J) in GEMM. Cannot replace kernel code.");
         continue;
       }
       
       // Validation: Cannot skip in K dimension (reduction dimension)
-      if (HasConstIncK && IncKVal != 1) {
+      // This check applies to both constant and non-constant increments
+      if (!isIncOne(IncK)) {
         ORE.emit(ORM << "Cannot skip elements in reduction dimension K. Cannot replace kernel code.");
         continue;
       }
