@@ -248,19 +248,18 @@ static inline auto matchPHITimesLD(PHINode *&PHI, Value *&LD) {
 }
 
 // A helper function that returns a matcher of a GEP instruction used to
-// compute the effective address of a flat-array (1D) or 2D-array. The returned
-// matcher captures the PointerOperand (Op), both PHINode instructions used to
-// compute the effective address (PHI1 & PHI2) and, if used, the leading
-// dimension value of the array (LD). The returned matcher accounts for
-// different pattern of IR that are generated when accessing flat or 2D
-// arrays.
+// compute the effective address of a flat-array (1D), 2D-array, or submatrix
+// with row/column offsets. The returned matcher captures the PointerOperand 
+// (Op), both PHINode instructions used to compute the effective address (PHI1 & PHI2) 
+// and, if used, the leading dimension value of the array (LD). The returned 
+// matcher accounts for different pattern of IR that are generated when accessing 
+// flat or 2D arrays.
 static inline auto
 match1Dor2DPtrOpAndInductionVariables(GetElementPtrInst *&GEPInst, Value *&Op,
                                       PHINode *&PHI1, PHINode *&PHI2,
                                       Value *&LD) {
   // TODO: Make dummy GEPs optional
   GetElementPtrInst *DummyGEP;
-  
   auto Pattern1 = m_GEP(DummyGEP, m_Load(m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2))),
                         m_PHI(PHI1));
   auto Pattern2 = m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), matchPHITimesLD(PHI1, LD)),
@@ -270,7 +269,7 @@ match1Dor2DPtrOpAndInductionVariables(GetElementPtrInst *&GEPInst, Value *&Op,
   auto Pattern4 = m_GEP(GEPInst, m_Value(Op), m_PHI(PHI1), m_PHI(PHI2));
   auto Pattern5 = m_GEP(GEPInst, m_Value(Op), linearFunctionOfPHI(PHI1, PHI2, LD));
   
- // Linearized 2D access: GEP(base, sext(offset + PHI + LD*PHI))
+ // Linearized 2D access - GEP(base, sext(offset + PHI + LD*PHI))
  auto Pattern6 = m_GEP(
     GEPInst, m_Value(Op),
     m_CombineOr(
@@ -290,7 +289,22 @@ match1Dor2DPtrOpAndInductionVariables(GetElementPtrInst *&GEPInst, Value *&Op,
                 m_Mul(m_Value(LD), m_CombineOr(m_Trunc(m_PHI(PHI2)), m_PHI(PHI2))),
                 m_Add(m_Value(), m_CombineOr(m_Trunc(m_PHI(PHI1)), m_PHI(PHI1)))))));
   
-  return m_OneOf(Pattern1, Pattern2, Pattern3, Pattern4, Pattern5, Pattern6);
+  // Nested GEP for 2D submatrix - GEP(GEP(base, PHI2), mul(add(PHI1, offset), LD))
+  auto Pattern7 = m_GEP(
+    GEPInst, 
+    m_GEP(DummyGEP, m_Value(Op), m_PHI(PHI2)),
+    m_c_Mul(
+        m_c_Add(m_PHI(PHI1), m_Value()),
+        m_OneOf(m_SExt(m_Value(LD)), m_ZExt(m_Value(LD)), m_Value(LD))));
+
+  // 1D linearized submatrix access - GEP(base, sext(add(PHI, offset)))
+  auto Pattern8 = m_GEP(
+    GEPInst, m_Value(Op),
+    m_CombineOr(
+        m_SExt(m_c_Add(m_CombineOr(m_Trunc(m_PHI(PHI1)), m_PHI(PHI1)), m_Value())),
+        m_SExt(m_CombineOr(m_Trunc(m_PHI(PHI1)), m_PHI(PHI1)))));
+  
+  return m_OneOf(Pattern1, Pattern2, Pattern3, Pattern4, Pattern5, Pattern6, Pattern7, Pattern8);
 }
 
 // A helper function that returns a matcher of a load to flat or 2D array. The
@@ -343,7 +357,10 @@ matchStoreOfMatrixC(MatcherType ReductionMatcher, GetElementPtrInst *&GEPC,
                        scaledValueOrValue(
                            m_CombineOr(m_PHI(m_Zero(), ReductionMatcher),
                                        ReductionMatcher),
-                           Alpha))),
+                           Alpha)),
+              // Reduction without PHI wrapper for submatrix patterns
+              m_c_FAdd(scaledValueOrValue(m_Load(m_Value(GEP)), Beta),
+                       scaledValueOrValue(ReductionMatcher, Alpha))),
       match1Dor2DPtrOpAndInductionVariables(GEPC, C, IdxC1, IdxC2, LDC));
 }
 
@@ -575,15 +592,77 @@ static Loop *getOuterLoop(LoopInfo &LI, Value *const &I, Value *const &J,
 // If the access order is not one listed above then this function returns
 // false, since their respective accesses are not part of a GEMM. Otherwise,
 // this function returns true and ALayout, BLayout, and CLayout accordingly.
+//
+// NOTE: For 1D linearized submatrix access, A2 and/or C2 may be NULL on input.
+// This function will infer missing PHIs from the loop structure and captured PHIs.
 static bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1,
                               PHINode *&B2, PHINode *&C1, PHINode *&C2,
                               CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
                               CBLAS_ORDER &CLayout, Value *&I, Value *&J,
                               Value *&K, Value *&IncI, Value *&IncJ, Value *&IncK,
                               LoopInfo &LI) {
-  if (A1 == nullptr || A2 == nullptr || B1 == nullptr || B2 == nullptr ||
-      C1 == nullptr || C2 == nullptr)
+  
+  // Handle 1D linearized submatrix access - infer missing PHIs
+  if ((A2 == nullptr || C2 == nullptr) && B1 != nullptr && B2 != nullptr) {
+    std::set<PHINode*> CapturedPHIs;
+    if (A1) CapturedPHIs.insert(A1);
+    if (A2) CapturedPHIs.insert(A2);
+    if (B1) CapturedPHIs.insert(B1);
+    if (B2) CapturedPHIs.insert(B2);
+    if (C1) CapturedPHIs.insert(C1);
+    if (C2) CapturedPHIs.insert(C2);
+    
+    PHINode *MissingPHI = nullptr;
+    if (CapturedPHIs.size() == 2) {
+      PHINode *ReferencePHI = *CapturedPHIs.begin();
+      Loop *InnerLoop = LI.getLoopFor(ReferencePHI->getParent());
+      
+      for (Loop *L = InnerLoop; L != nullptr; L = L->getParentLoop()) {
+        for (auto &Phi : L->getHeader()->phis()) {
+          PHINode *P = &Phi;
+          Value *Inc = nullptr;
+          if (extractOutermostPHI(P, Inc) == P) {
+            if (CapturedPHIs.find(P) == CapturedPHIs.end()) {
+              MissingPHI = P;
+              break;
+            }
+          }
+        }
+        if (MissingPHI || L->getLoopDepth() <= InnerLoop->getLoopDepth() - 2)
+          break;
+      }
+    }
+    
+    // Infer A2 and C2 based on GEMM dimension semantics
+    if (A2 == nullptr && A1 != nullptr) {
+      if (A1 == B1 || A1 == B2) {
+        if (C1 != nullptr && C1 != B1 && C1 != B2)
+          A2 = C1;
+        else if (C2 != nullptr && C2 != B1 && C2 != B2)
+          A2 = C2;
+        else if (MissingPHI != nullptr)
+          A2 = MissingPHI;
+      } else {
+        A2 = B1;
+      }
+    }
+    
+    if (C2 == nullptr && C1 != nullptr) {
+      if (C1 == B2)
+        C2 = A2;
+      else if (C1 == B1)
+        C2 = B2;
+      else
+        C2 = B2;
+      
+      if (C2 == nullptr && MissingPHI != nullptr)
+        C2 = MissingPHI;
+    }
+  }
+  
+  if (A1 == nullptr || B1 == nullptr || B2 == nullptr || C1 == nullptr)
     return false;
+  
   bool Matched = true;
 
   // Extract increments from original (innermost) PHI nodes
@@ -605,6 +684,7 @@ static bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1,
   PHINode *II = nullptr;
   PHINode *JJ = nullptr;
   PHINode *KK = nullptr;
+  
   if (A1 == B1) {
     II = A2;
     JJ = B2;
@@ -628,10 +708,8 @@ static bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1,
       CLayout = CBLAS_ORDER::RowMajor;
     else if (A2 == C2 && B1 == C1)
       CLayout = CBLAS_ORDER::ColMajor;
-    else {
-      // Not GEMM
+    else
       Matched = false;
-    }
   } else if (A2 == B1) {
     II = A1;
     JJ = B2;
@@ -642,10 +720,8 @@ static bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1,
       CLayout = CBLAS_ORDER::RowMajor;
     else if (A1 == C2 && B2 == C1)
       CLayout = CBLAS_ORDER::ColMajor;
-    else {
-      // Not GEMM
+    else
       Matched = false;
-    }
   } else if (A2 == B2) {
     II = A1;
     JJ = B1;
@@ -656,14 +732,13 @@ static bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1,
       CLayout = CBLAS_ORDER::RowMajor;
     else if (A1 == C2 && B1 == C1)
       CLayout = CBLAS_ORDER::ColMajor;
-    else {
-      // Not GEMM
+    else
       Matched = false;
-    }
   } else {
     // Not GEMM
     Matched = false;
   }
+  
   if (Matched) {
     auto DepthI = LI.getLoopDepth(II->getParent());
     auto DepthJ = LI.getLoopDepth(JJ->getParent());
